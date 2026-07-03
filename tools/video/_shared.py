@@ -694,3 +694,244 @@ def probe_output(path: Path) -> dict[str, Any]:
     except Exception:
         pass
     return info
+
+
+# ---------------------------------------------------------------------------
+# RunningHub (https://www.runninghub.cn) — workflow-based image/video API
+# Mirrors the TS submitRhTask / queryRhTask / uploadRhMedia / resolveMediaUrl /
+# pollRhResult helpers in toonflow-runninghub-person.ts.
+# ---------------------------------------------------------------------------
+
+RUNNINGHUB_BASE_URL = "https://www.runninghub.cn"
+
+
+def runninghub_submit(
+    workflow_id: str,
+    node_info_list: list[dict[str, Any]],
+    api_key: str,
+    *,
+    use_workflow_endpoint: bool = False,
+) -> str:
+    """Submit a RunningHub workflow task and return its task_id.
+
+    Default endpoint: POST /openapi/v2/run/ai-app/{workflow_id}
+    Workflow endpoint: POST /openapi/v2/run/workflow/{workflow_id}
+    (used by ltx23_four_frames; payload includes addMetadata=true)
+    """
+    import requests
+
+    path = "workflow" if use_workflow_endpoint else "ai-app"
+    url = f"{RUNNINGHUB_BASE_URL}/openapi/v2/run/{path}/{workflow_id}"
+
+    payload: dict[str, Any] = {
+        "nodeInfoList": node_info_list,
+        "instanceType": "default",
+        "usePersonalQueue": "true",
+    }
+    if use_workflow_endpoint:
+        payload["addMetadata"] = True
+
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
+    task_id = data.get("taskId")
+    if not task_id:
+        raise RuntimeError(f"RunningHub submit did not return taskId: {data}")
+    return task_id
+
+
+def runninghub_query(task_id: str, api_key: str) -> dict[str, Any]:
+    """Query RunningHub task status. Returns the full response dict."""
+    import requests
+
+    response = requests.post(
+        f"{RUNNINGHUB_BASE_URL}/openapi/v2/query",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={"taskId": task_id},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def upload_image_runninghub(image_path: str, api_key: str) -> str:
+    """Upload a local image (or media) file to RunningHub and return its download_url.
+
+    Mirrors TS uploadRhMedia multipart construction. Used by image-edit and
+    image-to-video workflows that need a hosted media URL.
+    """
+    import requests
+
+    path = Path(image_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    suffix = path.suffix.lower().lstrip(".")
+    mime_map = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+        "mp4": "video/mp4",
+        "mp3": "audio/mpeg",
+    }
+    mime = mime_map.get(suffix, "application/octet-stream")
+    ext = suffix if suffix in {"png", "jpg", "jpeg", "webp", "mp4", "mp3"} else "png"
+
+    boundary = f"----RHBoundary{int(time.time() * 1000):x}"
+    header = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="upload_{int(time.time())}.{ext}"\r\n'
+        f"Content-Type: {mime}\r\n\r\n"
+    ).encode("utf-8")
+    footer = f"\r\n--{boundary}--\r\n".encode("utf-8")
+    body = header + path.read_bytes() + footer
+
+    response = requests.post(
+        f"{RUNNINGHUB_BASE_URL}/openapi/v2/media/upload/binary",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if data.get("code") != 0 or not data.get("data", {}).get("download_url"):
+        raise RuntimeError(f"RunningHub media upload failed: {data}")
+    return data["data"]["download_url"]
+
+
+def runninghub_resolve_media(image_value: str, api_key: str) -> str:
+    """Resolve a media reference to a URL.
+
+    If image_value is already an http(s) URL, return it as-is. Otherwise treat
+    it as a local path and upload via upload_image_runninghub.
+    """
+    if image_value.startswith(("http://", "https://")):
+        return image_value
+    return upload_image_runninghub(image_value, api_key)
+
+
+def poll_runninghub(
+    task_id: str,
+    api_key: str,
+    *,
+    interval: float = 5.0,
+    timeout: float = 600.0,
+) -> tuple[str, bytes]:
+    """Poll a RunningHub task until SUCCESS, then download the result bytes.
+
+    Returns (download_url, file_bytes). Raises RuntimeError on FAILED/ERROR,
+    TimeoutError on timeout. Mirrors TS pollRhResult, but returns bytes for
+    direct file writes instead of base64.
+    """
+    import requests
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        data = runninghub_query(task_id, api_key)
+        status = data.get("status", "")
+        if status == "SUCCESS":
+            results = data.get("results") or []
+            url = results[0].get("url") if results else None
+            if not url:
+                raise RuntimeError("RunningHub task completed but no result URL")
+            dl = requests.get(url, timeout=120)
+            dl.raise_for_status()
+            return url, dl.content
+        if status in ("FAILED", "ERROR"):
+            msg = data.get("errorMessage") or data.get("errorCode") or status
+            raise RuntimeError(f"RunningHub task {status}: {msg}")
+        time.sleep(min(interval, max(0.0, deadline - time.time())))
+    raise TimeoutError(f"RunningHub task {task_id} timed out after {timeout}s")
+
+
+# ---------------------------------------------------------------------------
+# Grsai (https://grsai.dakka.com.cn) — nano-banana + gpt-image-2 generation API
+# Endpoints: POST /v1/api/generate (submit), GET /v1/api/result?id=<task_id> (poll)
+# ---------------------------------------------------------------------------
+
+GRSAI_BASE_URL = "https://grsai.dakka.com.cn"
+
+
+def grsai_generate(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+    """POST /v1/api/generate with the given payload. Returns the full response.
+
+    `payload` should include: model, prompt, images (optional), aspectRatio
+    (optional), imageSize (optional, nano-banana only), replyType (json/stream/async).
+
+    Response shape: {id, status, results: [{url}], progress, error}
+    """
+    import requests
+
+    response = requests.post(
+        f"{GRSAI_BASE_URL}/v1/api/generate",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=300,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def grsai_query_result(task_id: str, api_key: str) -> dict[str, Any]:
+    """GET /v1/api/result?id=<task_id>. Returns the full response dict."""
+    import requests
+
+    response = requests.get(
+        f"{GRSAI_BASE_URL}/v1/api/result",
+        params={"id": task_id},
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def poll_grsai(
+    task_id: str,
+    api_key: str,
+    *,
+    interval: float = 5.0,
+    timeout: float = 600.0,
+) -> tuple[str, bytes]:
+    """Poll a Grsai task until status=succeeded, then download the result bytes.
+
+    Returns (download_url, file_bytes). Raises RuntimeError on violation/failed,
+    TimeoutError on timeout. Status values: running, violation, succeeded, failed.
+    """
+    import requests
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        data = grsai_query_result(task_id, api_key)
+        status = data.get("status", "")
+        if status == "succeeded":
+            results = data.get("results") or []
+            url = results[0].get("url") if results else None
+            if not url:
+                raise RuntimeError(f"Grsai task succeeded but no result URL: {data}")
+            dl = requests.get(url, timeout=120)
+            dl.raise_for_status()
+            return url, dl.content
+        if status in ("failed", "violation"):
+            msg = data.get("error") or status
+            raise RuntimeError(f"Grsai task {status}: {msg}")
+        time.sleep(min(interval, max(0.0, deadline - time.time())))
+    raise TimeoutError(f"Grsai task {task_id} timed out after {timeout}s")
