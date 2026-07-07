@@ -169,14 +169,41 @@ class RunninghubVideo(BaseTool):
         except Exception as e:
             return ToolResult(success=False, error=f"Failed to build workflow nodes: {e}")
 
-        try:
-            task_id = runninghub_submit(
-                workflow_id, node_info_list, api_key,
-                use_workflow_endpoint=use_workflow_endpoint,
+        # Retry submit/poll on transient errors (queue limit / 5xx).
+        # RunningHub concurrency=1 — server-side queue can transiently look full
+        # while a prior task drains, so real backoff between retries matters.
+        TRANSIENT_TASK_MSG_MARKERS = (
+            "queue limit reached",
+            "503",
+            "502",
+            "504",
+            "Service Unavailable",
+        )
+        SUBMIT_RETRY_BACKOFF = (5, 10, 20, 40, 60)
+        last_exc: Exception | None = None
+        for attempt in range(5):
+            try:
+                task_id = runninghub_submit(
+                    workflow_id, node_info_list, api_key,
+                    use_workflow_endpoint=use_workflow_endpoint,
+                )
+                _url, video_bytes = poll_runninghub(task_id, api_key)
+                break
+            except Exception as e:
+                last_exc = e
+                err_str = str(e)
+                if any(m in err_str for m in TRANSIENT_TASK_MSG_MARKERS) and attempt < 4:
+                    time.sleep(SUBMIT_RETRY_BACKOFF[attempt])
+                    continue
+                return ToolResult(
+                    success=False,
+                    error=f"RunningHub video generation failed: {e}",
+                )
+        else:
+            return ToolResult(
+                success=False,
+                error=f"RunningHub video generation failed after 5 attempts: {last_exc}",
             )
-            _url, video_bytes = poll_runninghub(task_id, api_key)
-        except Exception as e:
-            return ToolResult(success=False, error=f"RunningHub video generation failed: {e}")
 
         output_path = Path(inputs.get("output_path", f"runninghub_{model_alias}.mp4"))
         output_path.parent.mkdir(parents=True, exist_ok=True)

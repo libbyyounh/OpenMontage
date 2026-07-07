@@ -158,11 +158,43 @@ class RunninghubImage(BaseTool):
         except Exception as e:
             return ToolResult(success=False, error=f"Failed to build workflow nodes: {e}")
 
-        try:
-            task_id = runninghub_submit(workflow_id, node_info_list, api_key)
-            _url, image_bytes = poll_runninghub(task_id, api_key)
-        except Exception as e:
-            return ToolResult(success=False, error=f"RunningHub image generation failed: {e}")
+        # Retry whole submit/poll cycle on transient errors (queue limit 421, server 5xx).
+        # RunningHub enforces concurrency=1 per key, so even with the in-shared
+        # lock the server-side queue can transiently look full while a previous
+        # task drains — give it real time.
+        # `runninghub_submit` raises RuntimeError for non-taskId responses including
+        # transient codes; `poll_runninghub` raises on FAILED/ERROR task status.
+        TRANSIENT_TASK_MSG_MARKERS = (
+            "queue limit reached",
+            "503",
+            "502",
+            "504",
+            "Service Unavailable",
+        )
+        SUBMIT_RETRY_BACKOFF = (5, 10, 20, 40, 60)
+        last_exc: Exception | None = None
+        for attempt in range(5):
+            try:
+                task_id = runninghub_submit(workflow_id, node_info_list, api_key)
+                _url, image_bytes = poll_runninghub(task_id, api_key)
+                break
+            except Exception as e:
+                last_exc = e
+                err_str = str(e)
+                if any(m in err_str for m in TRANSIENT_TASK_MSG_MARKERS) and attempt < 4:
+                    backoff = SUBMIT_RETRY_BACKOFF[attempt]
+                    time.sleep(backoff)
+                    continue
+                return ToolResult(
+                    success=False,
+                    error=f"RunningHub image generation failed: {e}",
+                )
+        else:
+            # Loop completed without break (all retries exhausted)
+            return ToolResult(
+                success=False,
+                error=f"RunningHub image generation failed after 5 attempts: {last_exc}",
+            )
 
         output_path = Path(inputs.get("output_path", f"runninghub_{model_alias}.png"))
         output_path.parent.mkdir(parents=True, exist_ok=True)

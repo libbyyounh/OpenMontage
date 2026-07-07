@@ -704,6 +704,91 @@ def probe_output(path: Path) -> dict[str, Any]:
 
 RUNNINGHUB_BASE_URL = "https://www.runninghub.cn"
 
+# RunningHub enforces a per-API-key concurrency limit. The default is 1 — any
+# simultaneous submission across this process (multiple agents, threads, async
+# tasks) will hit errorCode=421 "queue limit reached". We serialize all
+# RunningHub API calls (upload, submit, poll, query, download) through a
+# module-level semaphore sized to match the server's allowance, so the caller
+# never has to think about concurrency control.
+#
+# The semaphore is created lazily on first use so the env var is read after
+# .env is loaded (tools that import _shared at module import time otherwise
+# capture a default before the env file is parsed).
+#
+# Override via env var: RUNNINGHUB_CONCURRENCY=N
+#   1 (default)  — strict serialization, fits any RunningHub key tier
+#   >1           — if your key tier allows more, raise N. Holding the permit
+#                  across the full poll/download cycle is still correct
+#                  because the server-side queue depth is the bottleneck,
+#                  not the wall time of a single in-flight task.
+import threading as _threading
+import os as _os
+from contextlib import contextmanager as _contextmanager
+
+_RH_CONCURRENCY = 1  # overwritten lazily in _get_rh_semaphore()
+_RH_SEMAPHORE: _threading.Semaphore | None = None
+_RH_SEMAPHORE_LOCK = _threading.Lock()  # protects lazy init
+
+
+def _get_rh_semaphore() -> _threading.Semaphore:
+    """Lazy-init the RunningHub semaphore from RUNNINGHUB_CONCURRENCY env var.
+
+    Created on first call so .env is parsed first; module import happens
+    earlier in some tool-loading paths.
+    """
+    global _RH_SEMAPHORE, _RH_CONCURRENCY
+    if _RH_SEMAPHORE is None:
+        with _RH_SEMAPHORE_LOCK:
+            if _RH_SEMAPHORE is None:
+                try:
+                    n = int(_os.environ.get("RUNNINGHUB_CONCURRENCY", "1"))
+                except ValueError:
+                    n = 1
+                if n < 1:
+                    n = 1
+                _RH_CONCURRENCY = n
+                _RH_SEMAPHORE = _threading.Semaphore(n)
+    return _RH_SEMAPHORE
+
+
+# Backoff schedule for transient errors. When concurrency=1 the server-side
+# queue can transiently look full while a prior task drains; longer waits
+# between retries prevent hot-spinning against the limit. With concurrency>1
+# the queue drains in parallel so backoff can be lighter, but we keep the
+# same schedule as a safe default. Index = attempt number (0-based).
+_RH_RETRY_BACKOFF = (5, 10, 20, 40, 60)
+
+
+def _rh_call(func, *args, **kwargs):
+    """Run a RunningHub API call under the configured concurrency limit.
+
+    Use this wrapper at every entry point that talks to the RunningHub API
+    (upload, submit, query, poll, download) so concurrent calls in the same
+    process don't blow the server-side concurrency budget.
+    """
+    sem = _get_rh_semaphore()
+    sem.acquire()
+    try:
+        return func(*args, **kwargs)
+    finally:
+        sem.release()
+
+
+@_contextmanager
+def _rh_permit():
+    """Context manager that acquires/releases one RunningHub concurrency permit.
+
+    Used by entry points that need to hold the permit across multiple internal
+    calls (e.g. submit + the full poll+download cycle). For single-call use,
+    `_rh_call` is simpler.
+    """
+    sem = _get_rh_semaphore()
+    sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
+
 
 def runninghub_submit(
     workflow_id: str,
@@ -717,7 +802,26 @@ def runninghub_submit(
     Default endpoint: POST /openapi/v2/run/ai-app/{workflow_id}
     Workflow endpoint: POST /openapi/v2/run/workflow/{workflow_id}
     (used by ltx23_four_frames; payload includes addMetadata=true)
+
+    Serialized through the RunningHub concurrency semaphore (sized from
+    RUNNINGHUB_CONCURRENCY env var, default 1) — parallel submits in the
+    same process return errorCode=421 if they exceed the limit.
     """
+    with _rh_permit():
+        return _runninghub_submit_locked(
+            workflow_id, node_info_list, api_key,
+            use_workflow_endpoint=use_workflow_endpoint,
+        )
+
+
+def _runninghub_submit_locked(
+    workflow_id: str,
+    node_info_list: list[dict[str, Any]],
+    api_key: str,
+    *,
+    use_workflow_endpoint: bool = False,
+) -> str:
+    """Inner submit — must be called while holding _RH_GLOBAL_LOCK."""
     import requests
 
     path = "workflow" if use_workflow_endpoint else "ai-app"
@@ -740,16 +844,35 @@ def runninghub_submit(
         json=payload,
         timeout=30,
     )
+    # Retry transient HTTP statuses (queue/full/inflight) before raising
+    TRANSIENT_HTTP = {500, 502, 503, 504}
+    if response.status_code in TRANSIENT_HTTP:
+        raise RuntimeError(
+            f"RunningHub submit transient HTTP {response.status_code} for workflow {workflow_id}"
+        )
     response.raise_for_status()
     data = response.json()
     task_id = data.get("taskId")
+    err_code = data.get("errorCode")
     if not task_id:
-        raise RuntimeError(f"RunningHub submit did not return taskId: {data}")
+        # 421 queue limit / 1000 unknown - re-raise so caller can retry the whole submit
+        msg = data.get("errorMessage", "")
+        raise RuntimeError(f"RunningHub submit did not return taskId: {data} (errorCode={err_code})")
     return task_id
 
 
 def runninghub_query(task_id: str, api_key: str) -> dict[str, Any]:
-    """Query RunningHub task status. Returns the full response dict."""
+    """Query RunningHub task status. Returns the full response dict.
+
+    Serialized through the RunningHub concurrency semaphore so we don't
+    poll-flood the server while another submit is in flight.
+    """
+    with _rh_permit():
+        return _runninghub_query_locked(task_id, api_key)
+
+
+def _runninghub_query_locked(task_id: str, api_key: str) -> dict[str, Any]:
+    """Inner query — must be called while holding _RH_GLOBAL_LOCK."""
     import requests
 
     response = requests.post(
@@ -770,7 +893,15 @@ def upload_image_runninghub(image_path: str, api_key: str) -> str:
 
     Mirrors TS uploadRhMedia multipart construction. Used by image-edit and
     image-to-video workflows that need a hosted media URL.
+
+    Serialized through the RunningHub concurrency semaphore.
     """
+    with _rh_permit():
+        return _upload_image_runninghub_locked(image_path, api_key)
+
+
+def _upload_image_runninghub_locked(image_path: str, api_key: str) -> str:
+    """Inner upload — must be called while holding _RH_GLOBAL_LOCK."""
     import requests
 
     path = Path(image_path)
@@ -798,20 +929,60 @@ def upload_image_runninghub(image_path: str, api_key: str) -> str:
     footer = f"\r\n--{boundary}--\r\n".encode("utf-8")
     body = header + path.read_bytes() + footer
 
-    response = requests.post(
-        f"{RUNNINGHUB_BASE_URL}/openapi/v2/media/upload/binary",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    data = response.json()
-    if data.get("code") != 0 or not data.get("data", {}).get("download_url"):
+    # Transient API error codes that warrant retry (queue/limit/auth blips).
+    # 1 = "ApiKey verification error" (intermittent), 421 = queue limit, 500/502/503/504 = server.
+    # RunningHub enforces concurrency=1 per API key, so even with the global
+    # lock the server-side queue depth can transiently look full while a
+    # previous task is still draining. Retry with longer backoff.
+    TRANSIENT_HTTP = {500, 502, 503, 504}
+    TRANSIENT_API_CODES = {1, 421}
+    last_exc: Exception | None = None
+    last_resp_data: dict | None = None
+
+    # With concurrency=1, expect to wait through the queue. 5 attempts ×
+    # 5/10/20/40/60s backoff ≈ 2-3 min before giving up.
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        response = requests.post(
+            f"{RUNNINGHUB_BASE_URL}/openapi/v2/media/upload/binary",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            timeout=60,
+        )
+        # Retry on transient HTTP statuses (without raising_for_status)
+        if response.status_code in TRANSIENT_HTTP:
+            last_exc = RuntimeError(
+                f"RunningHub media upload HTTP {response.status_code} (attempt {attempt + 1}/{max_attempts})"
+            )
+            time.sleep(_RH_RETRY_BACKOFF[attempt])
+            continue
+        response.raise_for_status()
+        data = response.json()
+        last_resp_data = data
+        api_code = data.get("code")
+        download_url = (data.get("data") or {}).get("download_url") if isinstance(data.get("data"), dict) else None
+        # Success path
+        if api_code == 0 and download_url:
+            return download_url
+        # Transient API codes -> retry
+        if api_code in TRANSIENT_API_CODES:
+            last_exc = RuntimeError(
+                f"RunningHub media upload transient error code={api_code} "
+                f"msg={data.get('msg', '')[:120]} (attempt {attempt + 1}/{max_attempts})"
+            )
+            time.sleep(_RH_RETRY_BACKOFF[attempt])
+            continue
+        # Permanent error -> raise immediately
         raise RuntimeError(f"RunningHub media upload failed: {data}")
-    return data["data"]["download_url"]
+
+    # All retries exhausted
+    raise RuntimeError(
+        f"RunningHub media upload failed after {max_attempts} attempts. Last error: {last_exc}. "
+        f"Last response: {last_resp_data}"
+    )
 
 
 def runninghub_resolve_media(image_value: str, api_key: str) -> str:
@@ -837,12 +1008,31 @@ def poll_runninghub(
     Returns (download_url, file_bytes). Raises RuntimeError on FAILED/ERROR,
     TimeoutError on timeout. Mirrors TS pollRhResult, but returns bytes for
     direct file writes instead of base64.
+
+    Serialized through the RunningHub concurrency semaphore for the full
+    poll+download cycle so concurrent waiters don't all hit the server at
+    the same interval.
     """
+    with _rh_permit():
+        return _poll_runninghub_locked(
+            task_id, api_key,
+            interval=interval, timeout=timeout,
+        )
+
+
+def _poll_runninghub_locked(
+    task_id: str,
+    api_key: str,
+    *,
+    interval: float = 5.0,
+    timeout: float = 600.0,
+) -> tuple[str, bytes]:
+    """Inner poll — must be called while holding _RH_GLOBAL_LOCK."""
     import requests
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        data = runninghub_query(task_id, api_key)
+        data = _runninghub_query_locked(task_id, api_key)
         status = data.get("status", "")
         if status == "SUCCESS":
             results = data.get("results") or []
