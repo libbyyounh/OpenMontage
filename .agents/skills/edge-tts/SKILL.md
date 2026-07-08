@@ -51,6 +51,9 @@ selector. Pass native strings when calling `edge_tts` directly for precise contr
 - No SLA; the endpoint may rate-limit or change. For paid/SLA work, use ElevenLabs /
   Google TTS / OpenAI / DashScope / Doubao.
 - No SSML passthrough in this tool (Standard scope).
+- **Requires `edge-tts>=7.0`.** Older 6.x builds hit `403 Invalid response status`
+  on the synthesize WebSocket because Microsoft changed the auth token algorithm;
+  the 7.x line regenerates it. If synthesis 403s, `pip install -U edge-tts`.
 
 ## Positioning
 

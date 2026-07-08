@@ -8,7 +8,7 @@ numpy>=1.24
 requests>=2.31
 google-auth>=2.0       # service-account auth for Google TTS + Imagen (Vertex AI)
 openai>=2.44.0         # Videos API support for Sora 2
-edge-tts>=6.1          # free Microsoft Edge TTS, no API key (zh-CN-XiaoxiaoNeural default voice)
+edge-tts>=7.0          # free Microsoft Edge TTS, no API key (needs >=7.0 for current Bing token; 6.x gets 403)
 
 # Backlot - the living storyboard (local board server)
 fastapi>=0.110
