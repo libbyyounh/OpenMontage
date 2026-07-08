@@ -133,3 +133,21 @@ def test_paid_tts_fallbacks_prefer_edge_before_piper():
         assert ft.index("edge_tts") < ft.index("piper_tts"), (
             f"{cls.name}: edge_tts must come before piper_tts"
         )
+
+
+@pytest.mark.skipif(
+    not os.environ.get("OPENMONTAGE_NETWORK_TESTS"),
+    reason="set OPENMONTAGE_NETWORK_TESTS=1 to run network TTS test",
+)
+def test_edge_tts_network_generate(tmp_path):
+    from tools.audio.edge_tts import EdgeTTS
+
+    tool = EdgeTTS()
+    out = tmp_path / "net.mp3"
+    result = tool.execute({"text": "你好，世界", "output_path": str(out)})
+    assert result.success, result.error
+    assert out.exists()
+    assert (
+        result.data["audio_duration_seconds"]
+        and result.data["audio_duration_seconds"] > 0
+    )
