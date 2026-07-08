@@ -148,7 +148,127 @@ class EdgeTTS(BaseTool):
         return 0.0
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
-        # Scaffold: real implementation added in Task 2.
+        if self.get_status() != ToolStatus.AVAILABLE:
+            return ToolResult(
+                success=False,
+                error="edge-tts not installed. " + self.install_instructions,
+            )
+
+        import time
+
+        start = time.time()
+        try:
+            result = self._generate(inputs)
+        except Exception as exc:
+            return ToolResult(success=False, error=f"edge-tts failed: {exc}")
+
+        result.duration_seconds = round(time.time() - start, 2)
+        result.cost_usd = 0.0
+        return result
+
+    def _generate(self, inputs: dict[str, Any]) -> ToolResult:
+        import asyncio
+        from pathlib import Path
+
+        from tools.analysis.audio_probe import probe_duration
+
+        text = inputs.get("text", "")
+        if not text.strip():
+            return ToolResult(success=False, error="edge-tts: empty text")
+
+        voice = inputs.get("voice", "zh-CN-XiaoxiaoNeural")
+        rate = self._coerce_rate(inputs)
+        volume = self._coerce_volume(inputs)
+        pitch = self._coerce_pitch(inputs)
+
+        output_path = Path(inputs.get("output_path", "edge_tts.mp3"))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            asyncio.run(
+                asyncio.wait_for(
+                    self._synthesize(
+                        text, voice, rate, volume, pitch, output_path
+                    ),
+                    timeout=300,
+                )
+            )
+        except asyncio.TimeoutError:
+            return ToolResult(
+                success=False, error="edge-tts timed out after 300s"
+            )
+
+        if not output_path.exists():
+            return ToolResult(
+                success=False,
+                error=f"edge-tts produced no output: {output_path}",
+            )
+
+        audio_duration = probe_duration(output_path)
+
         return ToolResult(
-            success=False, error="edge-tts execute not yet implemented"
+            success=True,
+            data={
+                "provider": self.provider,
+                "voice": voice,
+                "rate": rate,
+                "volume": volume,
+                "pitch": pitch,
+                "text_length": len(text),
+                "audio_duration_seconds": (
+                    round(audio_duration, 2) if audio_duration else None
+                ),
+                "output": str(output_path),
+                "format": "mp3",
+            },
+            artifacts=[str(output_path)],
+            model=voice,
         )
+
+    @staticmethod
+    def _coerce_rate(inputs: dict[str, Any]) -> str:
+        raw = inputs.get("rate")
+        if raw is None:
+            for key in ("speed", "speaking_rate"):
+                if inputs.get(key) is not None:
+                    raw = inputs[key]
+                    break
+        if raw is None:
+            return "+0%"
+        if isinstance(raw, (int, float)):
+            return f"{round((float(raw) - 1.0) * 100):+d}%"
+        return str(raw)
+
+    @staticmethod
+    def _coerce_volume(inputs: dict[str, Any]) -> str:
+        raw = inputs.get("volume")
+        if raw is None:
+            return "+0%"
+        if isinstance(raw, (int, float)):
+            return f"{round((float(raw) - 1.0) * 100):+d}%"
+        return str(raw)
+
+    @staticmethod
+    def _coerce_pitch(inputs: dict[str, Any]) -> str:
+        raw = inputs.get("pitch")
+        if raw is None:
+            return "+0Hz"
+        if isinstance(raw, (int, float)):
+            return f"{int(raw):+d}Hz"
+        return str(raw)
+
+    @staticmethod
+    async def _synthesize(
+        text: str,
+        voice: str,
+        rate: str,
+        volume: str,
+        pitch: str,
+        output_path: Path,
+    ) -> None:
+        import edge_tts
+
+        communicate = edge_tts.Communicate(
+            text, voice, rate=rate, volume=volume, pitch=pitch
+        )
+        await communicate.save(str(output_path))
