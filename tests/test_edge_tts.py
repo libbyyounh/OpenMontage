@@ -117,3 +117,19 @@ def test_edge_tts_empty_text():
     result = tool.execute({"text": "   "})
     assert not result.success
     assert "empty" in result.error.lower()
+
+
+def test_paid_tts_fallbacks_prefer_edge_before_piper():
+    from tools.audio.dashscope_tts import DashscopeTTS
+    from tools.audio.doubao_tts import DoubaoTTS
+    from tools.audio.elevenlabs_tts import ElevenLabsTTS
+    from tools.audio.google_tts import GoogleTTS
+    from tools.audio.openai_tts import OpenAITTS
+
+    for cls in (OpenAITTS, ElevenLabsTTS, GoogleTTS, DashscopeTTS, DoubaoTTS):
+        ft = cls.fallback_tools
+        assert "edge_tts" in ft, f"{cls.name} missing edge_tts fallback"
+        assert "piper_tts" in ft, f"{cls.name} missing piper_tts fallback"
+        assert ft.index("edge_tts") < ft.index("piper_tts"), (
+            f"{cls.name}: edge_tts must come before piper_tts"
+        )

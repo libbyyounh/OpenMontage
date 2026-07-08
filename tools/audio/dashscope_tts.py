@@ -47,6 +47,7 @@ class DashscopeTTS(BaseTool):
         "doubao_tts",
         "elevenlabs_tts",
         "openai_tts",
+        "edge_tts",
         "piper_tts",
     ]
     agent_skills = ["dashscope"]
