@@ -15,3 +15,5 @@ edge-tts>=7.0          # free Microsoft Edge TTS, no API key (needs >=7.0 for cu
 fastapi>=0.110
 uvicorn>=0.29
 watchfiles>=0.21
+
+websockets>=14.0       # Eleven v4 Turbo and realtime audio transports
